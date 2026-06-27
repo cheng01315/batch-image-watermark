@@ -1,0 +1,27 @@
+[package]
+name = "watermark-tool"
+version = "0.1.0"
+edition = "2021"
+description = "批量图片自动水印添加工具 (Rust + egui + image)"
+
+[dependencies]
+eframe = "0.28"                  # egui 官方桌面框架（winit + wgpu）
+egui = "0.28"                    # 即时模式 GUI
+image = { version = "0.25", features = ["jpeg", "png", "bmp", "webp"] }  # 图像编解码
+imageproc = "0.25"               # 图像处理扩展（affine/alpha混合等）
+anyhow = "1"                     # 便捷错误处理
+thiserror = "1"                  # 自定义错误类型
+rfd = "0.14"                     # 系统原生文件/目录选择对话框
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"                 # 参数持久化（JSON）
+directories = "6"                # 跨平台用户目录（AppData 等）
+walkdir = "2"                    # 递归遍历文件夹
+rayon = "1"                      # 数据并行（批量导出多线程加速）
+
+# ---------------- Release 体积优化配置（关键） ----------------
+[profile.release]
+opt-level = 3        # 最高优化等级（速度 + 体积）
+lto = "fat"          # 全程序链接时优化，体积显著减小
+codegen-units = 1    # 单代码单元，配合 LTO 最大化优化
+strip = true         # 移除调试符号与符号表
+panic = "abort"      # 移除 panic 展开代码，体积更小更快
