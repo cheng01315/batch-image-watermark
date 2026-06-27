@@ -12,7 +12,7 @@
 
 ---
 ## 🖼️ 软件预览
-![项目示例图片](https://raw.githubusercontent.com/cheng01315/batch-image-watermark/main/others/image.png)
+![项目示例图片](https://raw.githubusercontent.com/cheng01315/batch-image-watermark/main/others/image.jpg)
 
 ## ✨ 功能特性
 
