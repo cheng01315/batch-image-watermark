@@ -6,7 +6,6 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-000?logo=rust&logoColor=fff)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue)](#)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
 
