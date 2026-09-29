@@ -1,5 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod i18n;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -12,6 +14,8 @@ use egui::{Color32, RichText, ScrollArea};
 use image::imageops::FilterType;
 use image::{GenericImageView, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
+
+use i18n::{detect_system_lang, tf, Lang, Tr};
 
 // ==================== 数据结构定义 ====================
 
@@ -41,17 +45,18 @@ impl AnchorPoint {
         AnchorPoint::BottomRight,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
+        let t = lang.t();
         match self {
-            AnchorPoint::TopLeft => "↖ 左上",
-            AnchorPoint::TopCenter => "↑ 上中",
-            AnchorPoint::TopRight => "↗ 右上",
-            AnchorPoint::MiddleLeft => "← 左中",
-            AnchorPoint::Center => "⊙ 中心",
-            AnchorPoint::MiddleRight => "→ 右中",
-            AnchorPoint::BottomLeft => "↙ 左下",
-            AnchorPoint::BottomCenter => "↓ 下中",
-            AnchorPoint::BottomRight => "↘ 右下",
+            AnchorPoint::TopLeft => t.anchor_tl,
+            AnchorPoint::TopCenter => t.anchor_tc,
+            AnchorPoint::TopRight => t.anchor_tr,
+            AnchorPoint::MiddleLeft => t.anchor_ml,
+            AnchorPoint::Center => t.anchor_c,
+            AnchorPoint::MiddleRight => t.anchor_mr,
+            AnchorPoint::BottomLeft => t.anchor_bl,
+            AnchorPoint::BottomCenter => t.anchor_bc,
+            AnchorPoint::BottomRight => t.anchor_br,
         }
     }
 }
@@ -72,11 +77,12 @@ pub enum TilePattern {
 impl TilePattern {
     pub const ALL: [TilePattern; 3] = [TilePattern::Grid, TilePattern::Brick, TilePattern::Diagonal];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
+        let t = lang.t();
         match self {
-            TilePattern::Grid => "标准网格",
-            TilePattern::Brick => "砖墙交错",
-            TilePattern::Diagonal => "对角线无缝",
+            TilePattern::Grid => t.tile_grid,
+            TilePattern::Brick => t.tile_brick,
+            TilePattern::Diagonal => t.tile_diagonal,
         }
     }
 }
@@ -95,11 +101,12 @@ impl NameConflictStrategy {
         NameConflictStrategy::Skip,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
+        let t = lang.t();
         match self {
-            NameConflictStrategy::Rename => "重命名（加 _wm 后缀）",
-            NameConflictStrategy::Overwrite => "覆盖同名文件",
-            NameConflictStrategy::Skip => "跳过同名文件",
+            NameConflictStrategy::Rename => t.name_rename,
+            NameConflictStrategy::Overwrite => t.name_overwrite,
+            NameConflictStrategy::Skip => t.name_skip,
         }
     }
 }
@@ -118,9 +125,9 @@ impl ExportFormat {
         ExportFormat::Png,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
-            ExportFormat::SameAsSource => "与源图一致",
+            ExportFormat::SameAsSource => lang.t().fmt_same,
             ExportFormat::Jpeg => "JPEG",
             ExportFormat::Png => "PNG",
         }
@@ -207,6 +214,9 @@ pub struct PersistedConfig {
     pub export_format: ExportFormat,
     pub jpeg_quality: u8,
     pub name_strategy: NameConflictStrategy,
+    /// 用户手动选过的界面语言；缺失 / null 时按系统语言自动判定
+    #[serde(default)]
+    pub language: Option<Lang>,
 }
 
 impl Default for PersistedConfig {
@@ -217,6 +227,7 @@ impl Default for PersistedConfig {
             export_format: ExportFormat::SameAsSource,
             jpeg_quality: 85,
             name_strategy: NameConflictStrategy::Rename,
+            language: None,
         }
     }
 }
@@ -546,9 +557,11 @@ pub fn process_single_image(
     strategy: NameConflictStrategy,
     export_format: ExportFormat,
     jpeg_quality: u8,
+    lang: Lang,
 ) -> Result<(String, String)> {
+    let t = lang.t();
     let source = image::open(src_path)
-        .with_context(|| format!("无法打开源图: {}", src_path.display()))?;
+        .with_context(|| tf!(t.err_open_source, "path" => src_path.display()))?;
     let source_rgba = source.to_rgba8();
 
     let result_rgba = compose_watermark(&source_rgba, watermark_rgba, params);
@@ -563,10 +576,10 @@ pub fn process_single_image(
     if skipped {
         return Ok((
             "skipped".to_string(),
-            format!("文件已存在: {}", base_name),
+            tf!(t.err_file_exists, "name" => base_name),
         ));
     }
-    let out_path = out_path_opt.context("无法生成输出文件名")?;
+    let out_path = out_path_opt.context(tf!(t.err_output_name))?;
 
     if img_fmt == image::ImageFormat::Jpeg {
         let (width, height) = result_rgba.dimensions();
@@ -604,6 +617,9 @@ struct WatermarkApp {
     watermark_path: Option<PathBuf>,
     output_dir: Option<PathBuf>,
 
+    /// 当前界面语言（启动时按系统语言判定，之后可由用户手动切换）
+    lang: Lang,
+
     params: WatermarkParams,
     auto_preview: bool,
     preview_dirty: bool,
@@ -631,12 +647,15 @@ struct Toast {
 
 impl Default for WatermarkApp {
     fn default() -> Self {
+        // 启动语言：中文 Windows → 中文界面，其它语言 → 英文界面
+        let lang = detect_system_lang();
         let mut slf = Self {
             source_images: Vec::new(),
             current_preview_idx: 0,
             watermark_image: None,
             watermark_path: None,
             output_dir: None,
+            lang,
             params: WatermarkParams::default(),
             auto_preview: true,
             preview_dirty: true,
@@ -649,7 +668,7 @@ impl Default for WatermarkApp {
             progress_rx: None,
             last_progress: None,
             show_report_dialog: false,
-            status_message: "就绪".to_string(),
+            status_message: lang.t().ready.to_string(),
             toasts: Vec::new(),
         };
         slf.load_config();
@@ -677,6 +696,12 @@ impl WatermarkApp {
                     self.export_format = cfg.export_format;
                     self.jpeg_quality = cfg.jpeg_quality;
                     self.name_strategy = cfg.name_strategy;
+                    // 存过语言就用存过的（除非用环境变量强制指定），否则沿用系统语言判定结果
+                    if let Some(lang) = cfg.language {
+                        if i18n::lang_from_env().is_none() {
+                            self.lang = lang;
+                        }
+                    }
                 }
             }
         }
@@ -689,12 +714,30 @@ impl WatermarkApp {
             export_format: self.export_format,
             jpeg_quality: self.jpeg_quality,
             name_strategy: self.name_strategy,
+            language: Some(self.lang),
         };
         if let Some(path) = Self::config_path() {
             if let Ok(json) = serde_json::to_string_pretty(&cfg) {
                 let _ = std::fs::write(&path, json);
             }
         }
+    }
+
+    /// 当前语言的文案表
+    fn tr(&self) -> &'static Tr {
+        self.lang.t()
+    }
+
+    /// 切换界面语言（同步刷新窗口标题并写入配置）
+    fn set_lang(&mut self, lang: Lang, ctx: &egui::Context) {
+        if self.lang == lang {
+            return;
+        }
+        self.lang = lang;
+        self.status_message = self.lang.t().ready.to_string();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.tr().app_title.to_string()));
+        self.save_config();
+        ctx.request_repaint();
     }
 
     fn mark_preview_dirty(&mut self) {
@@ -743,7 +786,8 @@ impl WatermarkApp {
         let idx = self.current_preview_idx;
         let info = &self.source_images[idx];
         if !info.is_valid {
-            ui.colored_label(Color32::RED, format!("❌ 当前图片损坏: {}", info.error_msg.as_deref().unwrap_or("未知错误")));
+            let t = self.tr();
+            ui.colored_label(Color32::RED, tf!(t.err_corrupt, "msg" => info.error_msg.as_deref().unwrap_or(t.err_unknown)));
             return;
         }
 
@@ -788,7 +832,7 @@ impl WatermarkApp {
                     self.preview_dirty = false;
                 }
                 Err(e) => {
-                    ui.colored_label(Color32::RED, format!("❌ 预览加载失败: {}", e));
+                    ui.colored_label(Color32::RED, tf!(self.tr().err_preview_load, "e" => e));
                     return;
                 }
             }
@@ -804,11 +848,11 @@ impl WatermarkApp {
             return;
         }
         if self.source_images.is_empty() {
-            self.add_toast("请先选择源图片", Color32::RED);
+            self.add_toast(self.tr().err_no_source, Color32::RED);
             return;
         }
         if self.watermark_image.is_none() {
-            self.add_toast("请先选择水印图片", Color32::RED);
+            self.add_toast(self.tr().err_no_watermark, Color32::RED);
             return;
         }
 
@@ -819,7 +863,7 @@ impl WatermarkApp {
             .cloned()
             .collect();
         if valid_images.is_empty() {
-            self.add_toast("没有有效的源图片", Color32::RED);
+            self.add_toast(self.tr().err_no_valid_source, Color32::RED);
             return;
         }
 
@@ -841,12 +885,12 @@ impl WatermarkApp {
         };
 
         if let Err(e) = std::fs::create_dir_all(&output_dir) {
-            self.add_toast(format!("无法创建输出目录: {}", e), Color32::RED);
+            self.add_toast(tf!(self.tr().err_create_dir, "e" => e), Color32::RED);
             return;
         }
 
         if std::fs::metadata(&output_dir).is_err() {
-            self.add_toast("输出目录不存在或无写入权限", Color32::RED);
+            self.add_toast(self.tr().err_dir_unwritable, Color32::RED);
             return;
         }
 
@@ -860,6 +904,7 @@ impl WatermarkApp {
         let strategy = self.name_strategy;
         let fmt = self.export_format;
         let jpeg_q = self.jpeg_quality;
+        let lang = self.lang;
         let total = valid_images.len();
 
         let (tx, rx): (Sender<ExportProgress>, Receiver<ExportProgress>) = mpsc::channel();
@@ -902,6 +947,7 @@ impl WatermarkApp {
                     strategy,
                     fmt,
                     jpeg_q,
+                    lang,
                 ) {
                     Ok((status, _)) => match status.as_str() {
                         "success" => progress.success += 1,
@@ -946,22 +992,23 @@ impl WatermarkApp {
     fn reset_params(&mut self) {
         self.params = WatermarkParams::default();
         self.mark_preview_dirty();
-        self.add_toast("已重置所有参数", Color32::from_rgb(0x4C, 0xAF, 0x50));
+        self.add_toast(self.tr().reset_done, Color32::from_rgb(0x4C, 0xAF, 0x50));
     }
 
     fn current_watermark_size_display(&self) -> String {
+        let t = self.tr();
         if let Some(wm) = &self.watermark_image {
             if let Some(src) = self.source_images.get(self.current_preview_idx) {
                 if let Some((sw, sh)) = src.dimensions {
                     let scaled = resize_watermark(wm, sw, sh, self.params.scale_percent, self.params.absolute_width_px);
                     let (w, h) = scaled.dimensions();
-                    return format!("当前尺寸：{} × {} px", w, h);
+                    return tf!(t.wm_size_current, "w" => w, "h" => h);
                 }
             }
             let (w, h) = wm.dimensions();
-            format!("原始尺寸：{} × {} px", w, h)
+            tf!(t.wm_size_original, "w" => w, "h" => h)
         } else {
-            "未选择水印".to_string()
+            t.wm_not_selected.to_string()
         }
     }
 }
@@ -986,6 +1033,25 @@ impl eframe::App for WatermarkApp {
     }
 }
 
+/// 默认展开的折叠分区：首次打开软件时全部展开，用户仍可手动折叠，状态会被记住。
+fn collapsing_open(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    title: impl Into<egui::RichText>,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        egui::Id::new(id),
+        true,
+    );
+    state
+        .show_header(ui, |ui| {
+            ui.strong(title);
+        })
+        .body(add_contents);
+}
+
 impl WatermarkApp {
     fn render_ui(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("control_panel")
@@ -994,7 +1060,25 @@ impl WatermarkApp {
             .width_range(280.0..=500.0)
             .show(ctx, |ui| {
                 ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("🎛 控制面板");
+                    // 标题行：左侧标题，右侧中英文切换
+                    ui.horizontal(|ui| {
+                        ui.heading(format!("⚙ {}", self.tr().control_panel));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // 右对齐布局是从右往左放的，所以倒序渲染
+                            for lang in [Lang::En, Lang::Zh] {
+                                let selected = self.lang == lang;
+                                let resp = ui
+                                    .selectable_label(
+                                        selected,
+                                        RichText::new(lang.short_label()).small(),
+                                    )
+                                    .on_hover_text(self.tr().lang_tooltip);
+                                if resp.clicked() && !selected {
+                                    self.set_lang(lang, ctx);
+                                }
+                            }
+                        });
+                    });
                     ui.separator();
                     self.render_source_files_ui(ui);
                     ui.separator();
@@ -1019,20 +1103,21 @@ impl WatermarkApp {
     }
 
     fn render_source_files_ui(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("🖼 源图片", |ui| {
+        let t = self.tr();
+        collapsing_open(ui, "sec_source", format!("🖼 {}", t.sec_source), |ui| {
             ui.horizontal(|ui| {
-                if ui.button("📁 选择图片 (多选)").clicked() {
+                if ui.button(format!("📁 {}", t.btn_pick_images)).clicked() {
                     if let Some(paths) = rfd::FileDialog::new()
-                        .add_filter("图片文件", &["jpg", "jpeg", "png", "bmp", "webp"])
+                        .add_filter(t.filter_images, &["jpg", "jpeg", "png", "bmp", "webp"])
                         .pick_files()
                     {
                         self.source_images.clear();
                         self.add_source_images(paths);
                     }
                 }
-                if ui.button("➕ 追加").clicked() {
+                if ui.button(format!("➕ {}", t.btn_append)).clicked() {
                     if let Some(paths) = rfd::FileDialog::new()
-                        .add_filter("图片文件", &["jpg", "jpeg", "png", "bmp", "webp"])
+                        .add_filter(t.filter_images, &["jpg", "jpeg", "png", "bmp", "webp"])
                         .pick_files()
                     {
                         self.add_source_images(paths);
@@ -1040,12 +1125,12 @@ impl WatermarkApp {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(format!("已选：{} 张（有效 {}，损坏 {}）",
-                    self.source_images.len(),
-                    self.source_images.iter().filter(|i| i.is_valid).count(),
-                    self.source_images.iter().filter(|i| !i.is_valid).count(),
+                ui.label(tf!(t.selected_count,
+                    "total" => self.source_images.len(),
+                    "valid" => self.source_images.iter().filter(|i| i.is_valid).count(),
+                    "bad" => self.source_images.iter().filter(|i| !i.is_valid).count(),
                 ));
-                if ui.button("🗑 清空").clicked() {
+                if ui.button(format!("🗑 {}", t.btn_clear)).clicked() {
                     self.source_images.clear();
                     self.current_preview_idx = 0;
                     self.mark_preview_dirty();
@@ -1062,9 +1147,9 @@ impl WatermarkApp {
                     else { format!("{}MB", s/(1024*1024)) }
                 }).unwrap_or_else(|| "?".into());
                 let label = if info.is_valid {
-                    format!("[{}] {}  {}  {}", i + 1, name, dims_str, size_str)
+                    tf!(t.file_item, "i" => i + 1, "name" => name, "dims" => dims_str, "size" => size_str)
                 } else {
-                    format!("× [{}] {}  (损坏)", i + 1, name)
+                    tf!(t.file_item_bad, "i" => i + 1, "name" => name, "mark" => t.corrupt_mark)
                 };
                 items.push((i, label, i == self.current_preview_idx, info.is_valid));
             }
@@ -1104,36 +1189,37 @@ impl WatermarkApp {
     }
 
     fn render_watermark_ui(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("💧 水印图片", |ui| {
+        let t = self.tr();
+        collapsing_open(ui, "sec_watermark", format!("💧 {}", t.sec_watermark), |ui| {
             ui.horizontal(|ui| {
-                if ui.button("选择 PNG 水印").clicked() {
+                if ui.button(t.btn_pick_watermark).clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("PNG (推荐透明背景)", &["png"])
+                        .add_filter(t.filter_png, &["png"])
                         .pick_file()
                     {
                         if let Ok(img) = image::open(&p) {
                             let rgba = img.to_rgba8();
                             let has_alpha = rgba.pixels().any(|p| p.0[3] < 255);
                             if !has_alpha {
-                                self.add_toast("提示: 建议使用带透明背景的 PNG 以获得最佳效果", Color32::YELLOW);
+                                self.add_toast(t.wm_alpha_tip, Color32::YELLOW);
                             }
                             self.watermark_image = Some(Arc::new(rgba));
                             self.watermark_path = Some(p);
                             self.mark_preview_dirty();
                         } else {
-                            self.add_toast("无法读取水印图片", Color32::RED);
+                            self.add_toast(t.wm_load_fail, Color32::RED);
                         }
                     }
                 }
                 if self.watermark_path.is_some() {
-                    if ui.button("取消").clicked() {
+                    if ui.button(t.btn_remove).clicked() {
                         self.watermark_image = None;
                         self.watermark_path = None;
                         self.mark_preview_dirty();
                     }
-                    if ui.button("重选").clicked() {
+                    if ui.button(t.btn_reselect).clicked() {
                         if let Some(p) = rfd::FileDialog::new()
-                            .add_filter("PNG (推荐透明背景)", &["png"])
+                            .add_filter(t.filter_png, &["png"])
                             .pick_file()
                         {
                             if let Ok(img) = image::open(&p) {
@@ -1146,30 +1232,31 @@ impl WatermarkApp {
                 }
             });
             if let Some(p) = &self.watermark_path {
-                ui.label(format!("当前：{}", p.file_name().unwrap().to_string_lossy()));
+                ui.label(tf!(t.wm_current, "name" => p.file_name().unwrap().to_string_lossy()));
                 if let Some(wm) = &self.watermark_image {
                     let (w, h) = wm.dimensions();
-                    ui.label(format!("尺寸：{} × {} px", w, h));
+                    ui.label(tf!(t.wm_size, "w" => w, "h" => h));
                 }
             } else {
-                ui.label(RichText::new("未选择水印图片").weak().small());
+                ui.label(RichText::new(t.wm_none).weak().small());
             }
         });
     }
 
     fn render_output_dir_ui(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("📤 导出目录", |ui| {
+        let t = self.tr();
+        collapsing_open(ui, "sec_output", format!("📤 {}", t.sec_output), |ui| {
             ui.horizontal(|ui| {
-                if ui.button("选择目录").clicked() {
+                if ui.button(t.btn_pick_folder).clicked() {
                     if let Some(d) = rfd::FileDialog::new().pick_folder() {
                         self.output_dir = Some(d);
                     }
                 }
                 if self.output_dir.is_some() {
-                    if ui.button("取消").clicked() {
+                    if ui.button(t.btn_remove).clicked() {
                         self.output_dir = None;
                     }
-                    if ui.button("重选").clicked() {
+                    if ui.button(t.btn_reselect).clicked() {
                         if let Some(d) = rfd::FileDialog::new().pick_folder() {
                             self.output_dir = Some(d);
                         }
@@ -1180,21 +1267,23 @@ impl WatermarkApp {
                 .output_dir
                 .as_ref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "默认：源目录/watermarked_output".into());
+                .unwrap_or_else(|| t.output_default.to_string());
             ui.label(RichText::new(path_display).small());
         });
     }
 
     fn render_layout_ui(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("📍 布局模式", |ui| {
+        let t = self.tr();
+        let lang = self.lang;
+        collapsing_open(ui, "sec_layout", format!("📍 {}", t.sec_layout), |ui| {
             ui.horizontal(|ui| {
                 let mut dirty = false;
-                let resp = ui.selectable_label(self.params.layout_mode == LayoutMode::Single, "① 单个水印");
+                let resp = ui.selectable_label(self.params.layout_mode == LayoutMode::Single, t.mode_single);
                 if resp.clicked() && self.params.layout_mode != LayoutMode::Single {
                     self.params.layout_mode = LayoutMode::Single;
                     dirty = true;
                 }
-                let resp = ui.selectable_label(self.params.layout_mode == LayoutMode::Tiled, "② 平铺水印");
+                let resp = ui.selectable_label(self.params.layout_mode == LayoutMode::Tiled, t.mode_tiled);
                 if resp.clicked() && self.params.layout_mode != LayoutMode::Tiled {
                     self.params.layout_mode = LayoutMode::Tiled;
                     dirty = true;
@@ -1205,26 +1294,29 @@ impl WatermarkApp {
             ui.add_space(6.0);
 
             match self.params.layout_mode {
-                LayoutMode::Single => self.render_single_layout_ui(ui),
-                LayoutMode::Tiled => self.render_tiled_layout_ui(ui),
+                LayoutMode::Single => self.render_single_layout_ui(ui, lang),
+                LayoutMode::Tiled => self.render_tiled_layout_ui(ui, lang),
             }
         });
     }
 
-    fn render_single_layout_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("9 宫格锚点").strong());
+    fn render_single_layout_ui(&mut self, ui: &mut egui::Ui, lang: Lang) {
+        let t = lang.t();
+        ui.label(RichText::new(t.anchor_title).strong());
         let mut anchor_changed = false;
+        // 按钮宽度跟着面板宽度走，免得英文标签（"↑ Top Center"）被截断
+        let btn_w = ((ui.available_width() - 8.0) / 3.0).max(84.0);
         egui::Grid::new("anchor_grid").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
             for row in 0..3 {
                 for col in 0..3 {
                     let idx = row * 3 + col;
                     let ap = AnchorPoint::ALL[idx];
                     let is_sel = self.params.anchor == ap;
-                    let btn = egui::Button::new(ap.label()).min_size(egui::vec2(86.0, 28.0));
+                    let btn = egui::Button::new(ap.label(lang)).min_size(egui::vec2(btn_w, 28.0));
                     let resp = if is_sel {
-                        ui.add_sized([86.0, 28.0], btn.fill(Color32::from_rgb(0x1E, 0x88, 0xE5)))
+                        ui.add_sized([btn_w, 28.0], btn.fill(Color32::from_rgb(0x1E, 0x88, 0xE5)))
                     } else {
-                        ui.add_sized([86.0, 28.0], btn)
+                        ui.add_sized([btn_w, 28.0], btn)
                     };
                     if resp.clicked() && !is_sel {
                         self.params.anchor = ap;
@@ -1238,20 +1330,20 @@ impl WatermarkApp {
 
         let mut dirty = false;
         let resp = ui.add(
-            egui::Slider::new(&mut self.params.margin_px, 0..=500).text("边缘边距 (px)")
+            egui::Slider::new(&mut self.params.margin_px, 0..=500).text(t.margin)
         );
         if resp.changed() { dirty = true; }
         ui.horizontal(|ui| {
-            ui.label("X 偏移: ");
+            ui.label(t.offset_x);
             let r = ui.add(egui::DragValue::new(&mut self.params.offset_x).speed(1).range(-10000..=10000));
             if r.changed() { dirty = true; }
-            ui.label(" Y 偏移: ");
+            ui.label(t.offset_y);
             let r = ui.add(egui::DragValue::new(&mut self.params.offset_y).speed(1).range(-10000..=10000));
             if r.changed() { dirty = true; }
         });
         ui.add_space(4.0);
         let resp = ui.add(
-            egui::Slider::new(&mut self.params.rotation_deg, -180.0..=180.0).text("旋转角度 (°)").suffix("°")
+            egui::Slider::new(&mut self.params.rotation_deg, -180.0..=180.0).text(t.rotation).suffix("°")
         );
         if resp.changed() { dirty = true; }
         ui.horizontal(|ui| {
@@ -1277,14 +1369,15 @@ impl WatermarkApp {
         }
     }
 
-    fn render_tiled_layout_ui(&mut self, ui: &mut egui::Ui) {
+    fn render_tiled_layout_ui(&mut self, ui: &mut egui::Ui, lang: Lang) {
+        let t = lang.t();
         let mut dirty = false;
-        ui.label(RichText::new("平铺子模式").strong());
+        ui.label(RichText::new(t.tile_submode).strong());
         egui::ComboBox::from_id_source("tile_pattern")
-            .selected_text(self.params.tile_pattern.label())
+            .selected_text(self.params.tile_pattern.label(lang))
             .show_ui(ui, |ui| {
                 for mode in TilePattern::ALL {
-                    let resp = ui.selectable_label(self.params.tile_pattern == mode, mode.label());
+                    let resp = ui.selectable_label(self.params.tile_pattern == mode, mode.label(lang));
                     if resp.clicked() && self.params.tile_pattern != mode {
                         self.params.tile_pattern = mode;
                         dirty = true;
@@ -1294,34 +1387,35 @@ impl WatermarkApp {
         ui.add_space(6.0);
         let resp = ui.add(
             egui::Slider::new(&mut self.params.tile_spacing_x_pct, 0.0..=200.0)
-                .text("水平间距 (%)")
+                .text(t.tile_spacing_x)
                 .suffix("%")
         );
         if resp.changed() { dirty = true; }
         let resp = ui.add(
             egui::Slider::new(&mut self.params.tile_spacing_y_pct, 0.0..=200.0)
-                .text("垂直间距 (%)")
+                .text(t.tile_spacing_y)
                 .suffix("%")
         );
         if resp.changed() { dirty = true; }
-        ui.label(RichText::new("0% = 无缝紧贴，100% = 间距 = 水印尺寸").weak().small());
+        ui.label(RichText::new(t.tile_spacing_hint).weak().small());
 
         if dirty && self.auto_preview { self.mark_preview_dirty(); }
     }
 
     fn render_style_ui(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("🎨 样式参数（透明度 / 缩放）", |ui| {
+        let t = self.tr();
+        collapsing_open(ui, "sec_style", format!("🎨 {}", t.sec_style), |ui| {
             let mut dirty = false;
             let resp = ui.add(
-                egui::Slider::new(&mut self.params.opacity, 0.01..=1.0).text("透明度")
+                egui::Slider::new(&mut self.params.opacity, 0.01..=1.0).text(t.opacity)
             );
             if resp.changed() { dirty = true; }
 
             ui.separator();
-            ui.label(RichText::new("缩放控制").strong());
+            ui.label(RichText::new(t.scaling_title).strong());
             let resp = ui.add(
                 egui::Slider::new(&mut self.params.scale_percent, 10.0..=200.0)
-                    .text("相对缩放 (源短边%)")
+                    .text(t.scale_relative)
                     .suffix("%")
             );
             if resp.changed() {
@@ -1330,7 +1424,7 @@ impl WatermarkApp {
             }
 
             ui.horizontal(|ui| {
-                ui.label("绝对宽度 (px):");
+                ui.label(t.abs_width);
                 let mut abs_w = self.params.absolute_width_px.unwrap_or(0);
                 let r = ui.add(
                     egui::DragValue::new(&mut abs_w).speed(1).range(0..=10000)
@@ -1339,7 +1433,7 @@ impl WatermarkApp {
                     self.params.absolute_width_px = if abs_w > 0 { Some(abs_w) } else { None };
                     dirty = true;
                 }
-                if ui.button("清除").clicked() {
+                if ui.button(t.btn_clear).clicked() {
                     self.params.absolute_width_px = None;
                     dirty = true;
                 }
@@ -1349,7 +1443,7 @@ impl WatermarkApp {
 
             ui.add_space(6.0);
             if ui
-                .add_sized([ui.available_width(), 28.0], egui::Button::new("⟲ 重置所有参数"))
+                .add_sized([ui.available_width(), 28.0], egui::Button::new(format!("⟲ {}", t.btn_reset)))
                 .clicked()
             {
                 self.reset_params();
@@ -1362,34 +1456,37 @@ impl WatermarkApp {
     }
 
     fn render_preview_ctrls_ui(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("👁 预览控制", |ui| {
+        let t = self.tr();
+        collapsing_open(ui, "sec_preview_ctrl", format!("👁 {}", t.sec_preview_ctrl), |ui| {
             ui.horizontal(|ui| {
-                if ui.button("🔄 刷新预览").clicked() {
+                if ui.button(format!("🔄 {}", t.btn_refresh)).clicked() {
                     self.mark_preview_dirty();
                 }
-                let r = ui.checkbox(&mut self.auto_preview, "自动实时预览");
+                let r = ui.checkbox(&mut self.auto_preview, t.auto_preview);
                 if r.changed() {
-                    self.status_message = if self.auto_preview { "自动预览：开".into() } else { "自动预览：关（需手动刷新）".into() };
+                    self.status_message = if self.auto_preview { t.status_auto_on.into() } else { t.status_auto_off.into() };
                 }
             });
         });
     }
 
     fn render_export_ui(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("🚀 导出设置", |ui| {
-            ui.label(RichText::new("命名冲突策略").strong());
+        let t = self.tr();
+        let lang = self.lang;
+        collapsing_open(ui, "sec_export", format!("🚀 {}", t.sec_export), |ui| {
+            ui.label(RichText::new(t.name_conflict).strong());
             for strategy in NameConflictStrategy::ALL {
-                let r = ui.radio(self.name_strategy == strategy, strategy.label());
+                let r = ui.radio(self.name_strategy == strategy, strategy.label(lang));
                 if r.clicked() { self.name_strategy = strategy; }
             }
 
             ui.add_space(6.0);
-            ui.label(RichText::new("导出格式").strong());
+            ui.label(RichText::new(t.export_format).strong());
             egui::ComboBox::from_id_source("export_fmt")
-                .selected_text(self.export_format.label())
+                .selected_text(self.export_format.label(lang))
                 .show_ui(ui, |ui| {
                     for f in ExportFormat::ALL {
-                        let r = ui.selectable_label(self.export_format == f, f.label());
+                        let r = ui.selectable_label(self.export_format == f, f.label(lang));
                         if r.clicked() { self.export_format = f; }
                     }
                 });
@@ -1398,14 +1495,18 @@ impl WatermarkApp {
                 || matches!(self.export_format, ExportFormat::SameAsSource)
             {
                 let resp = ui.add(
-                    egui::Slider::new(&mut self.jpeg_quality, 1..=100).text("JPEG 质量").suffix("%")
+                    egui::Slider::new(&mut self.jpeg_quality, 1..=100).text(t.jpeg_quality).suffix("%")
                 );
                 if resp.changed() { /* no preview needed */ }
             }
 
             ui.add_space(12.0);
             let can_click = !self.export_in_progress;
-            let btn = egui::Button::new(if self.export_in_progress { "⏳ 导出中..." } else { "🚀 开始批量导出" });
+            let btn = egui::Button::new(if self.export_in_progress {
+                format!("⏳ {}", t.btn_exporting)
+            } else {
+                format!("🚀 {}", t.btn_export)
+            });
             let resp = if can_click {
                 ui.add_sized([ui.available_width(), 44.0], btn.fill(Color32::from_rgb(0x2E, 0x7D, 0x32)))
             } else {
@@ -1419,10 +1520,12 @@ impl WatermarkApp {
                 ui.add_space(6.0);
                 if let Some(p) = &self.last_progress {
                     let pct = if p.total > 0 { p.current as f32 / p.total as f32 } else { 0.0 };
-                    ui.add(egui::ProgressBar::new(pct).text(format!("正在处理 {}/{}  {}", p.current, p.total, p.current_file)));
-                    ui.label(format!("成功: {}  跳过: {}  失败: {}", p.success, p.skipped, p.failed));
+                    ui.add(egui::ProgressBar::new(pct).text(tf!(t.progress_processing,
+                        "cur" => p.current, "total" => p.total, "file" => p.current_file.clone())));
+                    ui.label(tf!(t.progress_stats,
+                        "ok" => p.success, "skip" => p.skipped, "fail" => p.failed));
                 }
-                if ui.button("⚠ 取消导出").clicked() {
+                if ui.button(format!("⚠ {}", t.btn_cancel_export)).clicked() {
                     self.cancel_flag.store(true, Ordering::SeqCst);
                 }
             }
@@ -1430,23 +1533,24 @@ impl WatermarkApp {
     }
 
     fn render_preview_panel_ui(&mut self, ui: &mut egui::Ui) {
+        let t = self.tr();
         ui.horizontal(|ui| {
-            ui.heading("👁 预览区域");
+            ui.heading(format!("👁 {}", t.sec_preview));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let total = self.source_images.len();
                 let mut nav = false;
-                if ui.button("▶ 下一张").clicked() && total > 0 {
+                if ui.button(format!("▶ {}", t.btn_next)).clicked() && total > 0 {
                     self.current_preview_idx = (self.current_preview_idx + 1) % total;
                     nav = true;
                 }
-                if ui.button("◀ 上一张").clicked() && total > 0 {
+                if ui.button(format!("◀ {}", t.btn_prev)).clicked() && total > 0 {
                     self.current_preview_idx = if self.current_preview_idx == 0 { total - 1 } else { self.current_preview_idx - 1 };
                     nav = true;
                 }
-                if ui.button("🔄 刷新预览").clicked() {
+                if ui.button(format!("🔄 {}", t.btn_refresh)).clicked() {
                     self.mark_preview_dirty();
                 }
-                let r = ui.checkbox(&mut self.auto_preview, "自动预览");
+                let r = ui.checkbox(&mut self.auto_preview, t.auto_preview);
                 if r.changed() {}
                 if nav { self.mark_preview_dirty(); }
             });
@@ -1456,9 +1560,9 @@ impl WatermarkApp {
         if self.source_images.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(120.0);
-                ui.label(RichText::new("请先从左侧选择「源图片」开始预览").heading().weak());
+                ui.label(RichText::new(t.empty_hint).heading().weak());
                 ui.add_space(12.0);
-                ui.label(RichText::new("提示: 支持多选 JPG / PNG / BMP / WEBP 格式").small().weak());
+                ui.label(RichText::new(t.empty_tip).small().weak());
             });
             return;
         }
@@ -1467,15 +1571,14 @@ impl WatermarkApp {
         let info = &self.source_images[idx];
         let name = info.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "?".into());
         let total = self.source_images.len();
-        ui.label(format!(
-            "正在预览：{}/{} — {}  {}",
-            idx + 1,
-            total,
-            name,
-            if total > 1 { "（当前图预览，导出处理全部）" } else { "" }
+        ui.label(tf!(t.previewing,
+            "i" => idx + 1,
+            "total" => total,
+            "name" => name,
+            "note" => if total > 1 { t.preview_all_note } else { "" },
         ));
         if let Some((w, h)) = info.dimensions {
-            ui.label(RichText::new(format!("原图尺寸：{} × {} px", w, h)).small().weak());
+            ui.label(RichText::new(tf!(t.source_dims, "w" => w, "h" => h)).small().weak());
         }
         ui.add_space(6.0);
 
@@ -1494,7 +1597,8 @@ impl WatermarkApp {
         let mut should_close = false;
         let show = self.show_report_dialog;
         let mut open = show;
-        egui::Window::new("📋 导出结果报告")
+        let t = self.tr();
+        egui::Window::new(format!("📋 {}", t.report_title))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -1502,18 +1606,19 @@ impl WatermarkApp {
             .default_size([480.0, 360.0])
             .show(ctx, |ui| {
                 if let Some(p) = &self.last_progress {
-                    ui.heading(if p.is_cancelled { "⚠ 导出已取消" } else { "✅ 导出完成" });
-                    ui.label(format!("总处理：{} 张", p.total));
-                    ui.label(format!(
-                        "成功：{} 张  |  跳过：{} 张  |  失败：{} 张",
-                        p.success, p.skipped, p.failed
-                    ));
+                    ui.heading(if p.is_cancelled { t.report_cancelled } else { t.report_done });
+                    ui.label(tf!(t.report_total, "total" => p.total));
+                    ui.label(tf!(t.report_stats,
+                        "ok" => p.success, "skip" => p.skipped, "fail" => p.failed));
                     if p.is_cancelled {
-                        ui.colored_label(Color32::from_rgb(0xFF, 0x98, 0x00), format!("已完成 {}/{} 张，用户中途取消", p.current, p.total));
+                        ui.colored_label(
+                            Color32::from_rgb(0xFF, 0x98, 0x00),
+                            tf!(t.report_cancel_note, "cur" => p.current, "total" => p.total),
+                        );
                     }
                     if !p.failed_items.is_empty() {
                         ui.separator();
-                        ui.label(RichText::new("失败详情:").strong());
+                        ui.label(RichText::new(t.failed_details).strong());
                         ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
                             for (name, err) in &p.failed_items {
                                 ui.label(format!("× {}: {}", name, err));
@@ -1522,7 +1627,7 @@ impl WatermarkApp {
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("📂 打开导出文件夹").clicked() {
+                        if ui.button(format!("📂 {}", t.btn_open_folder)).clicked() {
                             let dir = self.output_dir.clone().unwrap_or_else(|| {
                                 self.source_images
                                     .first()
@@ -1531,7 +1636,7 @@ impl WatermarkApp {
                             });
                             let _ = open_path(&dir);
                         }
-                        if ui.button("关闭").clicked() {
+                        if ui.button(t.btn_close).clicked() {
                             should_close = true;
                         }
                     });
@@ -1585,8 +1690,9 @@ fn open_path(path: &Path) -> Result<()> {
 fn install_cjk_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
+    // 1) 中文字体候选：按顺序取第一个能读到的（避免一次性把几十 MB 字体塞进内存）
     #[cfg(target_os = "windows")]
-    let font_candidates: &[&str] = &[
+    let cjk_candidates: &[&str] = &[
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyh.ttf",
         r"C:\Windows\Fonts\msyhbd.ttc",
@@ -1595,43 +1701,79 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     ];
 
     #[cfg(target_os = "macos")]
-    let font_candidates: &[&str] = &[
+    let cjk_candidates: &[&str] = &[
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
     ];
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    let font_candidates: &[&str] = &[
+    let cjk_candidates: &[&str] = &[
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ];
 
-    let mut loaded: Vec<String> = Vec::new();
-    for (i, path) in font_candidates.iter().enumerate() {
+    // 2) 符号兜底字体：图标 / 箭头 / 几何符号等。
+    //    egui 自带的 emoji 字体覆盖不全（例如 🎛 ⚙ ↑ ↓ ← → ⊙ ①② 就缺失），
+    //    这些字形由系统符号字体兜住，缺了就会显示成方框。
+    #[cfg(target_os = "windows")]
+    let symbol_candidates: &[&str] = &[
+        r"C:\Windows\Fonts\seguisym.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+    ];
+
+    #[cfg(not(target_os = "windows"))]
+    let symbol_candidates: &[&str] = &[];
+
+    // 中文字体插到字体族最前面（优先用于正文），符号字体挂在最后作为兜底
+    let mut priority: Vec<String> = Vec::new();
+    for (i, path) in cjk_candidates.iter().enumerate() {
         if let Ok(bytes) = std::fs::read(path) {
             let name = format!("cjk_font_{}", i);
             fonts
                 .font_data
                 .insert(name.clone(), egui::FontData::from_owned(bytes));
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, name.clone());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push(name.clone());
-            loaded.push(path.to_string());
+            priority.push(name);
             break;
         }
     }
 
-    if loaded.is_empty() {
+    let mut fallback: Vec<String> = Vec::new();
+    for (i, path) in symbol_candidates.iter().enumerate() {
+        if let Ok(bytes) = std::fs::read(path) {
+            let name = format!("symbol_font_{}", i);
+            fonts
+                .font_data
+                .insert(name.clone(), egui::FontData::from_owned(bytes));
+            fallback.push(name);
+        }
+    }
+
+    if priority.is_empty() {
         eprintln!("[warn] 未找到任何 CJK 字体，中文可能显示为方框");
+    }
+    if fallback.is_empty() {
+        eprintln!("[warn] 未找到符号兜底字体，部分图标可能显示为方框");
+    }
+
+    let proportional = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    for (i, name) in priority.iter().enumerate() {
+        proportional.insert(i, name.clone());
+    }
+    for name in &fallback {
+        proportional.push(name.clone());
+    }
+
+    let monospace = fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default();
+    for name in priority.iter().chain(fallback.iter()) {
+        monospace.push(name.clone());
     }
 
     ctx.set_fonts(fonts);
@@ -1650,19 +1792,23 @@ fn install_cjk_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    // 先建 App：构造时读配置并按系统语言定界面语言，窗口标题也跟着语言走
+    let app = WatermarkApp::default();
+    let title = app.tr().app_title;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 840.0])
             .with_min_inner_size([960.0, 620.0])
-            .with_title("批量图片水印工具 (Rust + egui)"),
+            .with_title(title),
         ..Default::default()
     };
     eframe::run_native(
-        "批量图片水印工具",
+        title,
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             install_cjk_fonts(&cc.egui_ctx);
-            Ok(Box::<WatermarkApp>::default())
+            Ok(Box::new(app))
         }),
     )
 }
